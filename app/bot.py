@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 import tempfile
@@ -17,7 +18,11 @@ from pypdf import PdfReader
 from .analyzer import analyze_statement
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SBER_ONLINE_URL = os.getenv("SBER_ONLINE_URL", "https://online.sberbank.ru/")
@@ -31,16 +36,28 @@ class Flow(StatesGroup):
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📄 Получить выписку", callback_data="get_statement")],
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📄 Получить выписку", callback_data="get_statement")],
+        ]
+    )
 
 
 def sber_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏦 Открыть СберБанк Онлайн", url=SBER_ONLINE_URL)],
-        [InlineKeyboardButton(text="📎 Я получил выписку", callback_data="waiting_statement")],
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🏦 Открыть СберБанк Онлайн", url=SBER_ONLINE_URL)],
+            [InlineKeyboardButton(text="📎 Я получил выписку", callback_data="waiting_statement")],
+        ]
+    )
+
+
+def report_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📄 Получить новую выписку", callback_data="get_statement")],
+        ]
+    )
 
 
 @router.message(CommandStart())
@@ -68,12 +85,21 @@ async def get_statement(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "waiting_statement")
 async def waiting_statement(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(Flow.waiting_statement)
-    await callback.message.answer("Отлично. Пришли сюда PDF-файл выписки — я начну анализ сразу после получения.")
+    await callback.message.answer(
+        "Отлично. Пришли сюда PDF-файл выписки — я начну анализ сразу после получения."
+    )
     await callback.answer()
 
 
-async def extract_pdf_text(path: Path) -> str:
+def extract_pdf_text(path: Path) -> str:
+    """Extract text from a text-based PDF.
+
+    This function is intentionally synchronous because it is executed via
+    asyncio.to_thread() so PDF parsing does not block Telegram updates.
+    """
     reader = PdfReader(str(path))
+    if not reader.pages:
+        raise ValueError("PDF does not contain pages")
     return "\n".join(page.extract_text() or "" for page in reader.pages)
 
 
@@ -83,40 +109,51 @@ def format_report(result: dict) -> str:
         "📊 <b>Отчёт по выписке</b>",
         "",
         f"Операций распознано: <b>{len(result['operations'])}</b>",
-        f"Регулярных платежей-кандидатов: <b>{counts.get('регулярный платёж неизвестного типа', 0)}</b>",
+        f"Платежей неизвестного типа: <b>{counts.get('регулярный платёж неизвестного типа', 0)}</b>",
         f"Банковских/финансовых операций: <b>{counts.get('банковская комиссия/услуга', 0) + counts.get('перевод/финансовая операция', 0)}</b>",
         "",
         "<b>Подписки</b>",
     ]
+
     subscriptions = result["subscriptions"]
     if not subscriptions:
         lines.append("Пока нет подписок с достаточным количеством повторений для уверенного определения.")
     else:
         for item in subscriptions[:10]:
-            lines.extend([
-                "",
-                f"• <b>{item.merchant}</b>",
-                f"  ≈ {item.amount:.2f} ₽ / {item.period_days:.0f} дней",
-                f"  Повторений: {item.occurrences}",
-                f"  Уверенность: {item.confidence:.0%}",
-                f"  Основание: {item.reason}",
-            ])
+            merchant = html.escape(item.merchant)
+            reason = html.escape(item.reason)
+            lines.extend(
+                [
+                    "",
+                    f"• <b>{merchant}</b>",
+                    f"  ≈ {item.amount:.2f} ₽ / {item.period_days:.0f} дней",
+                    f"  Повторений: {item.occurrences}",
+                    f"  Уверенность: {item.confidence:.0%}",
+                    f"  Основание: {reason}",
+                ]
+            )
 
     service_like = [
-        c for c in result["classifications"]
+        c
+        for c in result["classifications"]
         if c.type == "подписка/сервис" and c.operation.outgoing
     ]
     if service_like:
         lines.extend(["", "<b>Сервисы, требующие дополнительной проверки</b>"])
         for c in service_like[:10]:
-            lines.append(f"• {c.operation.description[:90]} — {c.operation.amount:.2f} ₽ ({c.confidence:.0%})")
+            description = html.escape(c.operation.description[:90])
+            lines.append(
+                f"• {description} — {c.operation.amount:.2f} ₽ ({c.confidence:.0%})"
+            )
 
-    lines.extend([
-        "",
-        "ℹ️ Регулярность сама по себе не означает подписку. "
-        "В отчёт не включаются как подписки операции, похожие на банковские комиссии и переводы.",
-        "Результат является аналитическим предположением, а не финансовой рекомендацией.",
-    ])
+    lines.extend(
+        [
+            "",
+            "ℹ️ Регулярность сама по себе не означает подписку. "
+            "В отчёт не включаются как подписки операции, похожие на банковские комиссии и переводы.",
+            "Результат является аналитическим предположением, а не финансовой рекомендацией.",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -125,29 +162,51 @@ async def statement_received(message: Message, state: FSMContext, bot: Bot) -> N
     document = message.document
     if not document:
         return
+
     if document.file_size and document.file_size > MAX_FILE_SIZE:
-        await message.answer(f"Файл слишком большой. Максимальный размер: {MAX_FILE_SIZE // 1024 // 1024} МБ.")
+        await message.answer(
+            f"Файл слишком большой. Максимальный размер: {MAX_FILE_SIZE // 1024 // 1024} МБ."
+        )
         return
-    if not document.file_name or not document.file_name.lower().endswith(".pdf"):
+
+    filename = (document.file_name or "").lower()
+    if not filename.endswith(".pdf"):
         await message.answer("Для этого MVP пришли, пожалуйста, PDF-выписку из СберБанка.")
         return
 
     await message.answer("⏳ Выписка получена. Распознаю операции и проверяю регулярные платежи…")
     tmp_path: Path | None = None
+
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             tmp_path = Path(tmp.name)
-        await bot.download(document, destination=tmp_path)
+
+        # Use the documented aiogram short download method with file_id.
+        await bot.download(document.file_id, destination=tmp_path)
+
         text = await asyncio.to_thread(extract_pdf_text, tmp_path)
-        if len(text.strip()) < 100:
-            await message.answer("Не удалось извлечь текст из PDF. Пришли текстовую PDF-выписку из СберБанка или выгрузку в табличном формате.")
+        text = text.strip()
+        if len(text) < 100:
+            await message.answer(
+                "Не удалось извлечь достаточно текста из PDF. "
+                "Пришли текстовую PDF-выписку из СберБанка, а не скан/фото."
+            )
             return
+
         result = await asyncio.to_thread(analyze_statement, text)
-        await message.answer(format_report(result), parse_mode="HTML")
+        await message.answer(
+            format_report(result),
+            parse_mode="HTML",
+            reply_markup=report_keyboard(),
+        )
         await state.clear()
-    except Exception:
-        logging.exception("Statement analysis failed")
-        await message.answer("Не удалось обработать выписку. Проверь, что это PDF из СберБанка, и попробуй ещё раз.")
+
+    except Exception as exc:
+        logger.exception("Statement analysis failed: %s", exc)
+        await message.answer(
+            "Не удалось обработать выписку. Попробуй отправить PDF ещё раз. "
+            "Если ошибка повторится, пришли мне текст ошибки из окна Python."
+        )
     finally:
         if tmp_path:
             tmp_path.unlink(missing_ok=True)
@@ -161,6 +220,7 @@ async def wrong_document(message: Message) -> None:
 async def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
+
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
