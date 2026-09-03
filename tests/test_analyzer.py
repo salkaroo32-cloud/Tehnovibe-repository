@@ -1,4 +1,4 @@
-from app.analyzer import analyze_statement
+from app.analyzer import analyze_statement, parse_statement_text
 
 
 SAMPLE = """
@@ -19,14 +19,23 @@ SAMPLE = """
 
 def test_regular_charge_is_not_subscription():
     result = analyze_statement(SAMPLE)
-    assert any(c.type == "банковская комиссия/услуга" and "Regular Charge" in c.operation.description for c in result["classifications"])
+    charges = [
+        c for c in result["classifications"]
+        if "Regular Charge" in c.operation.description
+    ]
+    assert charges
+    assert all(c.type == "банковская комиссия/услуга" for c in charges)
+    assert not result["subscriptions"]
 
 
 def test_yandex_is_service_candidate_but_not_subscription_from_one_payment():
     result = analyze_statement(SAMPLE)
-    service_candidates = [c for c in result["classifications"] if c.type == "подписка/сервис"]
+    service_candidates = [
+        c for c in result["classifications"]
+        if c.type == "подписка/сервис"
+    ]
     assert any("YANDEX" in c.operation.description.upper() for c in service_candidates)
-    assert not any("Yandex Plus" == s.merchant for s in result["subscriptions"])
+    assert not any(s.merchant == "Yandex Plus" for s in result["subscriptions"])
 
 
 def test_repeated_service_can_be_subscription():
@@ -42,3 +51,29 @@ def test_repeated_service_can_be_subscription():
 """
     result = analyze_statement(sample)
     assert any(s.merchant == "Yandex Plus" for s in result["subscriptions"])
+
+
+def test_sber_processing_date_in_description_does_not_break_operation_parsing():
+    text = """
+26.06.2026 17:21 Прочие операции 40,00 1 960,00
+06.07.2026 514360 3801 Regular Charge: June. Операция по карте ****5402
+"""
+    operations = parse_statement_text(text)
+    assert len(operations) == 1
+    assert operations[0].date.strftime("%d.%m.%Y") == "26.06.2026"
+    assert operations[0].amount == 40.0
+    assert "Regular Charge" in operations[0].description
+
+
+def test_sber_transfer_and_incoming_transfer_are_not_services():
+    text = """
+03.09.2026 22:53 Прочие операции +10,00 10,00
+03.09.2026 107150 Т-Банк. Операция по карте ****5402
+14.08.2026 20:28 Перевод СБП 2 000,00 0,00
+14.08.2026 269734 Перевод в T-Bank. Операция по карте ****5402
+14.08.2026 20:03 Перевод на карту +2 000,00 2 000,00
+14.08.2026 913710 Перевод от С. Сергей Александрович. Операция по карте ****5402
+"""
+    result = analyze_statement(text)
+    assert not any(c.type == "подписка/сервис" for c in result["classifications"])
+    assert all(c.type in {"перевод/финансовая операция", "недостаточно данных"} for c in result["classifications"])
