@@ -17,16 +17,25 @@ from pypdf import PdfReader
 
 from .analyzer import analyze_statement
 
-load_dotenv()
+# Always load .env from the project root, even when the bot is started from
+# another working directory.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-SBER_ONLINE_URL = os.getenv("SBER_ONLINE_URL", "https://online.sberbank.ru/")
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "15")) * 1024 * 1024
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+SBER_ONLINE_URL = (os.getenv("SBER_ONLINE_URL") or "https://online.sberbank.ru/").strip()
+
+try:
+    MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "15"))
+except ValueError:
+    MAX_FILE_SIZE_MB = 15
+MAX_FILE_SIZE = max(1, MAX_FILE_SIZE_MB) * 1024 * 1024
 
 router = Router()
 
@@ -92,11 +101,7 @@ async def waiting_statement(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 def extract_pdf_text(path: Path) -> str:
-    """Extract text from a text-based PDF.
-
-    This function is intentionally synchronous because it is executed via
-    asyncio.to_thread() so PDF parsing does not block Telegram updates.
-    """
+    """Extract text from a text-based PDF synchronously."""
     reader = PdfReader(str(path))
     if not reader.pages:
         raise ValueError("PDF does not contain pages")
@@ -120,16 +125,14 @@ def format_report(result: dict) -> str:
         lines.append("Пока нет подписок с достаточным количеством повторений для уверенного определения.")
     else:
         for item in subscriptions[:10]:
-            merchant = html.escape(item.merchant)
-            reason = html.escape(item.reason)
             lines.extend(
                 [
                     "",
-                    f"• <b>{merchant}</b>",
+                    f"• <b>{html.escape(item.merchant)}</b>",
                     f"  ≈ {item.amount:.2f} ₽ / {item.period_days:.0f} дней",
                     f"  Повторений: {item.occurrences}",
                     f"  Уверенность: {item.confidence:.0%}",
-                    f"  Основание: {reason}",
+                    f"  Основание: {html.escape(item.reason)}",
                 ]
             )
 
@@ -181,7 +184,7 @@ async def statement_received(message: Message, state: FSMContext, bot: Bot) -> N
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             tmp_path = Path(tmp.name)
 
-        # Use the documented aiogram short download method with file_id.
+        # aiogram 3.31 supports downloading by file_id to a local Path.
         await bot.download(document.file_id, destination=tmp_path)
 
         text = await asyncio.to_thread(extract_pdf_text, tmp_path)
@@ -205,7 +208,7 @@ async def statement_received(message: Message, state: FSMContext, bot: Bot) -> N
         logger.exception("Statement analysis failed: %s", exc)
         await message.answer(
             "Не удалось обработать выписку. Попробуй отправить PDF ещё раз. "
-            "Если ошибка повторится, пришли мне текст ошибки из окна Python."
+            "Если ошибка повторится, пришли мне ошибку из окна Python."
         )
     finally:
         if tmp_path:
@@ -219,7 +222,9 @@ async def wrong_document(message: Message) -> None:
 
 async def main() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set")
+        raise RuntimeError(
+            "BOT_TOKEN is not set. Create .env in the project root and add BOT_TOKEN=..."
+        )
 
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
