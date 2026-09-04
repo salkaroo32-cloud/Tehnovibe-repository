@@ -7,6 +7,7 @@ import os
 import tempfile
 from pathlib import Path
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -16,9 +17,8 @@ from dotenv import load_dotenv
 from pypdf import PdfReader
 
 from .analyzer import analyze_statement
+from .sber_redirect import create_app, public_redirect_url
 
-# Always load .env from the project root, even when the bot is started from
-# another working directory.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 SBER_ONLINE_URL = (os.getenv("SBER_ONLINE_URL") or "https://online.sberbank.ru/").strip()
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+try:
+    WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
+except ValueError:
+    WEB_PORT = 8080
 
 try:
     MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "15"))
@@ -53,9 +58,11 @@ def main_keyboard() -> InlineKeyboardMarkup:
 
 
 def sber_keyboard() -> InlineKeyboardMarkup:
+    redirect_url = public_redirect_url()
+    bank_url = redirect_url or SBER_ONLINE_URL
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🏦 Открыть СберБанк Онлайн", url=SBER_ONLINE_URL)],
+            [InlineKeyboardButton(text="🏦 Открыть СберБанк Онлайн", url=bank_url)],
             [InlineKeyboardButton(text="📎 Я получил выписку", callback_data="waiting_statement")],
         ]
     )
@@ -101,7 +108,6 @@ async def waiting_statement(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 def extract_pdf_text(path: Path) -> str:
-    """Extract text from a text-based PDF synchronously."""
     reader = PdfReader(str(path))
     if not reader.pages:
         raise ValueError("PDF does not contain pages")
@@ -184,9 +190,7 @@ async def statement_received(message: Message, state: FSMContext, bot: Bot) -> N
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             tmp_path = Path(tmp.name)
 
-        # aiogram 3.31 supports downloading by file_id to a local Path.
         await bot.download(document.file_id, destination=tmp_path)
-
         text = await asyncio.to_thread(extract_pdf_text, tmp_path)
         text = text.strip()
         if len(text) < 100:
@@ -220,16 +224,37 @@ async def wrong_document(message: Message) -> None:
     await message.answer("Я жду PDF-выписку из СберБанка. Пришли её сюда как файл.")
 
 
+async def run_web_server() -> None:
+    app = create_app()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=WEB_PORT)
+    await site.start()
+    logger.info("Sber redirect server started on port %s", WEB_PORT)
+    if PUBLIC_BASE_URL:
+        logger.info("Public Sber redirect: %s/sber", PUBLIC_BASE_URL)
+    else:
+        logger.warning("PUBLIC_BASE_URL is not set; Telegram will use direct Sber URL")
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+
+
+async def run_bot() -> None:
+    bot = Bot(BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    await dp.start_polling(bot)
+
+
 async def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError(
             "BOT_TOKEN is not set. Create .env in the project root and add BOT_TOKEN=..."
         )
 
-    bot = Bot(BOT_TOKEN)
-    dp = Dispatcher()
-    dp.include_router(router)
-    await dp.start_polling(bot)
+    await asyncio.gather(run_bot(), run_web_server())
 
 
 if __name__ == "__main__":
